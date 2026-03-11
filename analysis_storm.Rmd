@@ -1,0 +1,361 @@
+---
+title: "Analysis of Storm Data"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+#Libraries
+
+```{r}
+library(Rcpp)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(R.matlab)
+library(readxl)
+library(FNN)
+library(RANN)
+library(sf)
+library(dbmss)
+
+
+```
+
+#Function definitions
+
+```{r}
+
+#for each pair of x,y calculates clostest distance to points in x.l,y.l
+get.nn <- function(x,y,z){#B: get the nearest neighbour
+require(FNN)#B: Fast Nearest Neighbor Search Algorithms
+pts <- cbind(x,y,z) #B:Take a sequence of vector, matrix or data-frame arguments and combine by columns or rows, respectively.
+d <- knn.dist(pts,k=1)#B: call th knn.dist from FNN package and now the only thing we need to see is whether this FNN function gets the nearest neighbours for 3D right as well
+#B:k-Nearest Neighbour Classification. it is function within the FNN package
+nn.ix <- knn.index(pts,k=1)
+return(list(d=d[,1],d_idx=nn.ix[,1]))
+}
+
+#########################################################################################################################################################
+
+my.nn <- function(dt){# B: calculate the nearest nearest neighbour
+xy <- as.data.table(dt)%>%.[,c("X Position [µm]","Y Position [µm]")]
+closest <- nn2(data=xy, k=2)[[1]]
+xynn<-xy[closest[, 2], ]
+colnames(xy)<-c("X1","Y1")
+colnames(xynn)<-c("X2","Y2")
+xx<-cbind(xy,xynn)%>%.[,distance:=((X1-X2)^2+(Y1-Y2)^2)^(1/2)]
+
+return(xx)
+}
+
+
+my.nn.r <- function(xy){# B: calculate the nearest nearest neighbour
+#xy <- as.data.table(dt)%>%.[,c("X Position [µm]","Y Position [µm]")]
+closest <- nn2(data=xy, k=2)[[1]]
+xynn<-xy[closest[, 2], ]
+colnames(xy)<-c("X1","Y1")
+colnames(xynn)<-c("X2","Y2")
+xx<-cbind(xy,xynn)%>%.[,distance:=((X1-X2)^2+(Y1-Y2)^2)^(1/2)]%>%.[]
+
+return(xx)
+}
+
+
+get.nnn <- function(x,y,z){# B: calculate the nearest nearest neighbour
+l = get.nn(x,y,z);
+iidx1 <- which.min(l$d);
+#print("Minimum NN distance")
+#print(l$d[iidx1])
+iidx2 <- l$d_idx[iidx1]
+#print(dist(matrix(c(x[idx1],x[idx2],y[idx1],y[idx2]),ncol=2)))
+#print(sqrt((x[iidx2]-x[iidx1])^2 + (y[iidx2]-y[iidx1])^2))
+return(list(idx1=iidx1, idx2=iidx2))
+}
+
+get.roi <- function(xx,yy, id) {
+  current.roi <- roi[file.name == id]
+      print(id)
+  if(nrow(current.roi)==0){
+        print("No roi found")
+  }
+  sapply(1:length(xx), function(i) {
+    #  print(current.roi[,between(yy[i], y_bottom_right, y_top_left)]);
+    current.roi[between(xx[i],x_top_left, x_bottom_right) & between(yy[i], y_bottom_right, y_top_left)][1, ROI]
+  } )
+}
+
+
+```
+
+#Load data
+
+```{r}
+library(readxl)
+library(sf)
+
+#E14 WT
+#CKO is WT vs DKO Primary
+#d2A is WT vs F2 Austin Smith
+
+xl_data <- "ROI_072023/"
+txt_data <- c("./data_072023")
+#file.names<-list.files(path = "FinalData/",pattern="xlsx")
+file.names<-list.files(path = txt_data, pattern="_utf8.txt", full.name = T)
+
+#list_all <- lapply(file.names,function(x)read_excel(x))
+list_all <- lapply(file.names, function(x) fread(x, sep="\t", skip= 1, header=TRUE) )#, fileEncoding = "UTF-16",check.names = F) )
+
+names(list_all)<-basename(file.names)
+
+roi.files <- list.files("./ROI_072023/", pattern = ".xlsx", full.names = T)
+roi.l <- lapply(roi.files, function(f) {read_excel(f) %>% as.data.table() %>% .[file_name=="", file_name := NA_character_] %>% .[,file.name := zoo::na.locf(file_name)]})
+names(roi.l) <- basename(roi.files)
+roi <- rbindlist(roi.l, idcol=F)
+
+# roi[, conversion_x := round(conversion_x, digits = 1)]
+# roi[, conversion_y := round(conversion_y, digits = 1)]
+# roi[, x_top := round(x_top, digits = 1)]
+# roi[, x_bottom := round(x_bottom, digits = 1)]
+# roi[, y_top := round(y_top, digits = 1)]
+# roi[, y_bottom := round(y_bottom, digits = 1)]
+
+roi[,x_top_left := round(x_top - min(x_top), digits = 1), by=.(file.name)] #conversion_x: center
+roi[,y_top_left := round(y_bottom - min(y_top), digits = 1)+0.0, by=.(file.name)]
+roi[,x_bottom_right := round(x_bottom - min(x_top), digits = 1)+0.0, by=.(file.name)]
+roi[,y_bottom_right := round(y_top - min(y_top), digits = 1), by=.(file.name)]
+
+cells <- fread("./STORM_ROI_cell_coordinates.txt") %>%
+  setnames(c("cell_line", "ROI"),c("cell.line", "roi.id"))
+
+dtr <- rbindlist(list_all,idcol=TRUE,fill=TRUE)
+setnames(dtr, c(1,3,4),c("sample.id","x","y"))
+dtr <- dtr[, if(all(`X DriftCorrection [µm]`==0)) .SD, by=sample.id]
+
+dtr[,condition:=stringr::word(sample.id, 2, sep="_")]
+dtr[, condition := ifelse(condition=="R", "release", condition )]
+dtr[,cell.line:=stringr::word(sample.id, 1, sep="_")]
+dtr[, isKO := cell.line %in% c("DKO","F2")]
+dtr[, group := factor(fcase(cell.line %in% c("DKO", "cKO"), "cKO/DKO", cell.line %in% c("d2A", "F2"), "d2A/F2", cell.line=="E14","E14"))]
+dtr[, image := as.numeric(stringr::word(sample.id, 4, sep="_"))]
+dtr[, roi.id := get.roi(x,y, stringr::word(.BY$sample.id,start=1, end=4,sep=stringr::fixed("_"))), by=.(sample.id)]
+
+
+dt <- merge(dtr, cells, by=c("cell.line","condition", "roi.id", "image"), all.x=F)
+
+```
+
+
+
+#Pair correlation function
+
+```{r}
+
+dt.pcf <- dt[!is.na(roi.id)][, spatstat.explore::pcf(ppp(x,y, window=owin(xrange=c(min(x),max(x)), yrange=c(min(y), max(y))), check = T), correction="isotropic"), by=.(sample.id, cell.line, condition, isKO, roi.id, group) ]
+
+#Remove outliers
+dt.pcf.filtered <- dt.pcf[, if(max(r)>0.48) .SD, by = .(sample.id, roi.id)] 
+
+ggplot(dt.pcf.filtered[r<0.02]
+       , aes(x=(r*1000), y=(iso), colour=factor(condition),fill=factor(isKO)))+
+  facet_grid(isKO~group)+
+  geom_vline(xintercept=50, linetype="dashed")+
+  geom_line(aes(group=factor(paste(roi.id, sample.id))), alpha=0.1)+
+  stat_summary_bin(fun=mean,  geom="line", bins=50, alpha=1)+
+  theme(aspect.ratio=1)+
+labs(x="Distance (nm)", y = "Pair correlation", color = "Condition" )
+
+ggsave("./pair_correlation_long.pdf", width=6, height=6)
+```
+
+# DBSCAN analysis
+
+```{r}
+
+dt[!is.na(roi.id), cluster.id.dbscan := dbscan::dbscan(cbind(x-min(x),y-min(y)) ,
+                                                   eps=0.05, 
+                                                   minPts=4
+                                                   #borderPoints=F 
+  )$cluster, by=.(sample.id,cell.line, condition, isKO, roi.id, group, cell) ]
+
+```
+
+# Analysis of clusters
+
+```{r}
+
+
+
+cluster.sizes <- dt[!is.na(roi.id) ,.(cluster.size = .N), by=.(cluster.id.dbscan, sample.id,cell.line, condition, isKO, roi.id, group, cell) ]
+
+cluster.summ <- cluster.sizes[, .(mean.cluster.size=mean(cluster.size[cluster.id.dbscan>0],na.rm=T),
+          n = .N), by=.(sample.id, cell.line, condition, isKO,  group, cell)] #}) 
+
+```
+
+##DBSCAN plots
+
+```{r}
+
+ggplot(cluster.summ[n>0 ], 
+         aes(x=condition, y = log10(mean.cluster.size), 
+                                         color=isKO, 
+                                         fill=isKO
+                                         )) +
+  facet_wrap(~group)+
+  geom_boxplot(outlier.colour = NA, alpha=0.5)+
+  scale_color_manual(values=my_palette[c(3,5)])+
+  scale_fill_manual(values=my_palette[c(3,5)])+
+  ggbeeswarm::geom_quasirandom(alpha=0.2, dodge.width=0.8)+
+  ggpubr::stat_compare_means(label.y = 3, label = "p.format", size = 2)+
+  labs(x="Distance", y="Log10(Cluster size)")+
+  theme(aspect.ratio=1, legend.position="none")
+
+ggsave("./cluster_size_boxplot_dbscan.pdf", width = 6, height = 2.5, useDingbats=F)
+
+
+ggplot(cluster.summ[n>0], 
+         aes(x=condition, y = log10(mean.cluster.size), 
+                                         color= cell.line, 
+                                         fill= cell.line
+                                         )) +
+  facet_wrap(~isKO)+
+  geom_boxplot(outlier.colour = NA, alpha=0.5)+
+  scale_color_manual(values=my_palette)+
+  scale_fill_manual(values=my_palette)+
+  ggbeeswarm::geom_quasirandom(alpha =0.2, dodge.width=0.8)+
+  #ggpubr::stat_compare_means(label.y = 3, label = "p.format", size = 3)+
+  labs(x="Distance", y="Log10(Cluster size)", color="Cell line", fill="Cell line")+
+  theme(aspect.ratio=3/4)
+
+ggsave("./cluster_size_2_boxplot_dbscan.pdf", width =8, height = 3, useDingbats=F)
+
+
+```
+
+
+```{r}
+ggplot(dt[, .(n=.N), by=.(isKO, group, condition,cell.line)],
+         aes(x=condition, y = n, 
+                                         color=isKO, 
+                                         fill=isKO
+                                         #group=roi.id
+                                         )) +
+  facet_wrap(~group)+
+  #stat_summary(fun=mean, geom="col", position="dodge")+
+  geom_boxplot(outlier.colour = NA, alpha=0.5)+
+  #stat_summary(fun.data = mean_se, geom="errorbar", position="dodge")+
+  ggpubr::stat_compare_means(label.y = 1, label = "p.format", size = 2)+
+  labs(x="Distance", y="Log10(Cluster size)")+
+  #coord_trans(ylim=c(0,1000))+
+  theme(aspect.ratio=1)
+
+ggplot(cluster.summ, 
+         aes(x=condition, y = mean.cluster.size, 
+                                         fill=isKO
+                                         #group=roi.id
+                                         )) +
+    facet_wrap(~group)+
+  #stat_summary(fun=median, geom="col", position="dodge")+
+  geom_boxplot(outlier.colour = NA, alpha=0.5)+
+  ggbeeswarm::geom_quasirandom(aes(group=isKO),position="dodge")+
+  #stat_summary(fun.data = median_hilow, geom="errorbar", position="dodge")+
+  ggpubr::stat_compare_means(label.y = 1.5, label = "p.format", size = 2)+
+  labs(x="Distance", y="Fraction clustered")+
+  #coord_trans(ylim=c(0,1.2))+
+  theme(aspect.ratio=1)
+
+ggsave("./frac_clustered_boxplot_eps002.pdf", width =8, height = 3, useDingbats=F)
+
+
+ggplot(cluster.shapes, 
+         aes(x=condition, y = log(cluster.area), 
+                                         color=isKO, 
+                                         fill=isKO
+                                         #group=roi.id
+                                         )) +
+    facet_wrap(~group)+
+  #stat_summary(fun=median, geom="col", position="dodge")+
+  geom_boxplot(outlier.colour = NA, alpha=0.5)+
+  #stat_summary(fun.data = median_hilow, geom="errorbar", position="dodge")+
+  ggpubr::stat_compare_means(label.y = 1.5, label = "p.format", size = 2)+
+  labs(x="Distance", y="Fraction clustered")+
+ # coord_trans(ylim=c(0,0.1))+
+  theme(aspect.ratio=1)
+
+
+ggplot(dt[, cluster.center.x := mean(x), by=.(cluster.id.dbscan, sample.id,cell.line, condition, isKO, roi.id, group)][, cluster.center.y:=mean(y), by=.(cluster.id.dbscan, sample.id,cell.line, condition, isKO, roi.id, group)], 
+       aes(x=(sqrt((x-cluster.center.x)^2 + (y-cluster.center.y)^2)), color=condition) )+
+  facet_wrap(~cell.line)+
+  stat_ecdf(aes(y=log(1-..y..)), geom="point", size=0.5)+
+  #stat_bin(aes(y=..density..), geom="line")+
+  scale_x_log10()+
+  theme(aspect.ratio=1)+
+  labs(x="Distance (μm)", y="Cumulative probability")
+
+ggsave("./dbscan_cluster_ecdf.png", width =8, height = 5)
+
+
+ggplot(dt[, cluster.center.x := mean(x), by=.(cluster.id.dbscan, sample.id,cell.line, condition, isKO, roi.id, group)][, cluster.center.y:=mean(y), by=.(cluster.id.dbscan, sample.id,cell.line, condition, isKO, roi.id, group)], 
+       aes(x=log(sqrt((x-cluster.center.x)^2 + (y-cluster.center.y)^2)), color=condition) )+
+  facet_wrap(~cell.line)+
+  stat_bin(aes(y=..density..), geom="line")+
+  #scale_x_log10()+
+  theme(aspect.ratio=1)+
+  labs(x="Distance (μm)", y="Cumulative probability")
+
+
+fwrite(cluster.summ, "./cluster_summ.txt")
+cluster.summ <- fread("./cluster_sum.txt")
+  #stat_summary(fun.data=mean_se, geom="errorbar", position=position_dodge(0.8), width=0.3, colour="darkgrey")
+```
+
+```{r}
+
+
+ggplot(cluster.summ[mean.cluster.size>0], aes(x=condition, y = (mean.cluster.size), 
+                                         color=isKO, 
+                                         fill=isKO, 
+                                         #group=roi.id
+                                         )) +
+  #facet_wrap(~isKO)+
+  #ggbeeswarm::geom_quasirandom()+
+  stat_summary(fun=mean, geom="col",width=0.8, position=position_dodge(0.8))+
+  stat_summary(fun.data=mean_se, geom="errorbar", position=position_dodge(0.8), width=0.3, colour="darkgrey")+
+ #ggpubr::stat_compare_means(aes(label = paste0("p = ", after_stat(p.format))), hide.ns = T, label.y = 9,format="p.signif"  )+
+ # ggbeeswarm::geom_quasirandom()
+  labs(x="Condition", y = "Cluster size (no. nucleosomes)", color ="Cell line",fill ="Cell line")+
+  theme(aspect.ratio=2)
+  ggsave("./cluster_size.pdf", width =3.5, height = 3, useDingbats=F)
+  
+ggplot(cluster.summ, aes(x=sqrt(cluster.size), y = cluster.disp, color=isKO, fill=isKO)) +
+  #facet_wrap(~(cell.line %in% c("cKO", "DKO")))+
+    #geom_point()+
+  stat_summary_bin(aes(group=interaction(condition,cell.line)))
+  #stat_summary(fun.data=mean_se, geom="errorbar", position=position_dodge(0.8), width=0.3, colour="darkgrey")+
+ #ggpubr::stat_compare_means(aes(label = paste0("p = ", after_stat(p.format))), hide.ns = T, label.y = 9,format="p.signif"  )+
+ # ggbeeswarm::geom_quasirandom()
+  theme(aspect.ratio=2)
+ # ggsave("./cluster_size.pdf", width =5, height = 3, useDingbats=F)
+
+ggplot(frac.clustered[cell.line %in% c("cKO", "DKO") & condition != "2i"], aes(x=condition, y = frac.clustered, fill=cell.line)) +
+  #facet_wrap(~(cell.line %in% c("cKO", "DKO")))+
+   stat_summary(fun=mean, geom="col",width=0.8, position=position_dodge(0.8))+
+  stat_summary(fun.data=mean_se, geom="errorbar", position=position_dodge(0.8), width=0.3, colour="darkgrey")+
+ #ggpubr::stat_compare_means(aes(label = paste0("p = ", after_stat(p.format))), hide.ns = T, label.y = 0.2, format="p.signif"  )+
+    labs(x="Condition", y = "Frac. clustered nucleosomes", color ="Cell line",fill ="Cell line")+
+  theme(aspect.ratio=2)
+  #ggpubr::stat_compare_means(hide.ns = T, label.y = 0.7,format="p.signif" )
+  ggsave("./fraction_clustered.pdf", width =5, height = 3, useDingbats=F)
+
+ggplot(cluster.summ, aes(x=condition, y = cluster.size, color=cell.line)) +
+  facet_wrap(~(cell.line %in% c("cKO", "DKO")))+
+  stat_summary(fun=function(x) sd(x)/mean(x), geom="point",size=5)
+
+ggplot(cluster.summ, aes(x=condition, y = cluster.disp, color=cell.line)) +
+  facet_wrap(~(cell.line %in% c("cKO", "DKO")))+
+  stat_summary(fun=mean, geom="point",size=5)
+
+
+
+```
